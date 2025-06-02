@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'>
+    <meta name='mobile-web-app-capable' content='yes'>
+    <meta name='apple-mobile-web-app-capable' content='yes'>
+
+    <meta http-equiv="origin-trial" content="Ahfj+MLeL6bh+LNmpnSdepftxoDHHwjUG2KWZ4jjCb1WoZxtBlzF3cDHuJNVqnhr3HXJwQ+kLaw57NO15S0mRwwAAABkeyJvcmlnaW4iOiJodHRwczovL2ltbWVyc2l2ZS13ZWIuZ2l0aHViLmlvOjQ0MyIsImZlYXR1cmUiOiJXZWJYUlBsYW5lRGV0ZWN0aW9uIiwiZXhwaXJ5IjoxNjI5ODQ5NTk5fQ==">
+
+    <title>Shared scene demo</title>
+
+    <link href='common.css' rel='stylesheet'></link>
+
+  </head>
+  <body>
+    <header>
+      <details open>
+        <summary>Shared scene demo</summary>
+        This sample demonstrates using shared reference space
+        <p>
+
+          <a class="back" href="./index.html">Back</a>
+        </p>
+      </details>
+    </header>
+
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/",
+          "troika-three-text": "/troika-three-text.esm.js",
+          "troika-three-utils": "/troika-three-utils.esm.js",
+          "troika-worker-utils": "/troika-worker-utils.esm.js",
+          "webgl-sdf-generator": "/webgl-sdf-generator.mjs",
+          "bidi-js":             "/bidi.mjs"
+        }
+      }
+    </script>
+
+    <script type="module">
+      // Code adapted from three.js' WebXR hit test sample.
+      // three.js is covered by MIT license which can be found at:
+      // https://github.com/mrdoob/three.js/blob/master/LICENSE
+
+
+      import * as THREE from 'three';
+      import {BoxLineGeometry} from 'three/addons/geometries/BoxLineGeometry.js';
+      import {XRControllerModelFactory} from 'three/addons/webxr/XRControllerModelFactory.js';
+      import {WebXRButton} from '/webxr-button.js';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import {Text} from 'troika-three-text'
+
+      let xrButton = null;
+      let camera, scene, renderer;
+      let room, spheres, skeleton;
+      let socket, peerjsConnection, peerID;
+      let madeRequest = false;
+      let peerServerDead = false;
+      let spaceRequested = false;
+      let viewerspace, sharedspace;
+      let peerconnections = {};
+      let controller1, controller2;
+			let controllerGrip1, controllerGrip2;
+      let framecount = 0;
+      let previousPositionString = "";
+      let previousLeftControllerString = "";
+      let previousRightControllerString = "";
+      const viewerGeometry = new THREE.BoxGeometry( .3, .2, .1 ); //new THREE.SphereGeometry(.1, 32, 16); 
+      const viewerMaterial = new THREE.MeshBasicMaterial({color: 0x0000ff}); 
+      const bulletGeometry = new THREE.SphereGeometry(.015, 32, 16 ); 
+      const bulletMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00 }); 
+      let scores = {};
+      let leftController, rightController;
+      const gltfLoader = new GLTFLoader();
+
+      let bullets = new THREE.Group();
+      let mixers = [];
+      const clock = new THREE.Clock();
+      const animationGroup = new THREE.AnimationObjectGroup();
+      const positionKF = new THREE.VectorKeyframeTrack('.position', [ 0, 1 ], [ 0, 0, 0, 0, 0, -3 ]);
+      const clip = new THREE.AnimationClip('Action', 1.01, [positionKF]);
+
+      init();
+
+      function dist(p) {
+        return Math.sqrt(p.x*p.x+p.y*p.y+p.z*p.z);
+      }
+
+      function peerConnection(connection) {
+        console.log("new connection from " + connection.peer);
+        if (!(connection.peer in peerconnections)) {
+          peerconnections[connection.peer] = connection;
+          connection.on('open', function () {
+            console.log("connection open");
+          });
+          connection.on('data', peerData);
+          connection.on('error', function (err) {
+            console.log("connection error: " + err);
+          });
+          connection.on('close', function () {
+            console.log("connection closed from " + this.peer);
+            delete peerconnections[connection.peer];
+            const playerElement = scene.getObjectByName(this.peer);
+            if (playerElement) {
+              scene.getObjectByName(playerElement);
+            }
+          });
+        }
+      }
+
+      function peerData(data) {
+        let playerWrap = scene.getObjectByName(this.peer);
+        let player;
+        let bulletGroup;
+        if (!playerWrap) {
+          playerWrap = new THREE.Group();
+          bulletGroup = new THREE.Group();
+          player = new THREE.Group();
+          let playerBox = new THREE.Mesh( viewerGeometry, viewerMaterial ); 
+          playerWrap.name = data.peer;
+          scene.add(playerWrap);
+          playerWrap.add(player);
+          player.add(playerBox);
+          playerWrap.add(bulletGroup);
+        } else {
+          player = playerWrap.children[0];
+          bulletGroup = playerWrap.children[1];
+        }
+
+        let scoreElement = player.getObjectByName('score');
+        let hitElement = player.getObjectByName('hit');
+        if (!scoreElement) {
+          scoreElement = new Text();
+          scoreElement.name = 'score';
+          scoreElement.fontSize = 0.05;
+          scoreElement.position.y = .25;
+          scoreElement.color = 0x00FF00;
+          scoreElement.textAlign = 'center';
+          scoreElement.addEventListener("synccomplete", () => {
+            const textWidth = scoreElement.geometry.boundingBox.max.x;
+            scoreElement.position.x = -textWidth/2;
+          });
+          player.add(scoreElement);
+
+          hitElement = new Text();
+          hitElement.name = 'hit';
+          hitElement.fontSize = 0.05;
+          hitElement.position.y = .31;
+          hitElement.color = 0xFF0000;
+          hitElement.textAlign = 'center';
+          hitElement.addEventListener("synccomplete", () => {
+            const textWidth = hitElement.geometry.boundingBox.max.x;
+            hitElement.position.x = -textWidth/2;
+          });
+          player.add(hitElement);
+        }
+        
+        const scoretext = "score: " + scores[this.peer][0];
+        if (scoretext !== scoreElement.text) {
+          scoreElement.text = scoretext;
+          scoreElement.sync();
+        }
+        const hittext = "hits: " + scores[this.peer][1];
+        if (hittext !== hitElement.text) {
+          hitElement.text = hittext;
+          hitElement.sync();
+        }
+
+        if(data.left) {
+          let controller = player.getObjectByName('left');
+          if (!controller) {
+            controller = leftController.scene.clone(); 
+            controller.name = 'left';
+            player.add(controller);
+          }
+          controller.position.copy(data.left.position);
+          controller.quaternion.copy(data.left.orientation);
+        } else {
+          let controller = player.getObjectByName('left');
+          if (controller)
+            controller.removeFromParent();
+        }
+
+        if(data.right) {
+          let controller = player.getObjectByName('right');
+          if (!controller) {
+            controller = rightController.scene.clone(); ; 
+            controller.name = 'right';
+            player.add(controller);
+          }
+          controller.position.copy(data.right.position);
+          controller.quaternion.copy(data.right.orientation);
+        } else {
+          let controller = player.getObjectByName('right');
+          if (controller)
+            controller.removeFromParent();
+        }
+
+        player.position.copy(data.position);
+        player.quaternion.copy(data.orientation);
+
+        while(bulletGroup.children.length < data.bullets.length) {
+          bulletGroup.add(new THREE.Mesh(bulletGeometry, bulletMaterial));
+        }
+        while(bulletGroup.children.length > data.bullets.length) {
+          bulletGroup.remove(bulletGroup.children[0]);
+        }
+
+        for(let x = 0; x < data.bullets.length; x++) {
+          bulletGroup.children[x].position.copy(data.bullets[x]);
+        }
+
+        let bullet = new THREE.Mesh(bulletGeometry, bulletMaterial); 
+      }
+
+      function init(){
+				scene = new THREE.Scene();
+				scene.background = new THREE.Color(0x505050);
+        scene.add(bullets);
+
+				camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 50);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        light.position.set(0.5, 1, 0.25);
+        scene.add(light);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+				renderer.setPixelRatio(window.devicePixelRatio);
+				renderer.setSize(window.innerWidth, window.innerHeight);
+				renderer.setAnimationLoop(render);
+				renderer.xr.enabled = true;
+        renderer.autoClear = false;
+				document.body.appendChild(renderer.domElement);
+
+        xrButton = new WebXRButton({
+          onRequestSession: onRequestSession,
+          onEndSession: onEndSession,
+          textEnterXRTitle: "START AR",
+          textXRNotFoundTitle: "AR NOT FOUND",
+          textExitXRTitle: "EXIT AR",
+        });
+
+        document.querySelector('header').appendChild(xrButton.domElement);
+
+        if (navigator.xr){
+          navigator.xr.isSessionSupported('immersive-ar')
+                      .then((supported) => {
+            xrButton.enabled = true;
+          });
+        }
+
+				function onSelectStart() {
+          let bullet = new THREE.Mesh(bulletGeometry, bulletMaterial); 
+          let bulletwrap = new THREE.Group();
+          bullets.add(bulletwrap);
+          bulletwrap.add(bullet);
+
+          bulletwrap.position.copy(this.position);
+          bulletwrap.quaternion.copy(this.quaternion);
+
+          const mixer = new THREE.AnimationMixer( bullet );
+          const clipAction = mixer.clipAction( clip );
+          clipAction.play();
+          mixers.push(mixer);
+        }
+
+        function onSelectEnd() {}
+
+        controller1 = renderer.xr.getController( 0 );
+        controller1.addEventListener( 'selectstart', onSelectStart );
+        controller1.addEventListener( 'selectend', onSelectEnd );
+        controller1.addEventListener( 'connected', function ( event ) {
+          this.add( buildController( event.data ) );
+        } );
+        controller1.addEventListener( 'disconnected', function () {
+          this.remove( this.children[ 0 ] );
+        } );
+        scene.add( controller1 );
+
+        controller2 = renderer.xr.getController( 1 );
+        controller2.addEventListener( 'selectstart', onSelectStart );
+        controller2.addEventListener( 'selectend', onSelectEnd );
+        controller2.addEventListener( 'connected', function ( event ) {
+          this.add( buildController( event.data ) );
+        } );
+        controller2.addEventListener( 'disconnected', function () {
+          this.remove( this.children[ 0 ] );
+        } );
+        scene.add( controller2 );
+
+        const controllerModelFactory = new XRControllerModelFactory();
+
+        controllerGrip1 = renderer.xr.getControllerGrip( 0 );
+        controllerGrip1.add( controllerModelFactory.createControllerModel( controllerGrip1 ) );
+        scene.add( controllerGrip1 );
+
+        controllerGrip2 = renderer.xr.getControllerGrip( 1 );
+        controllerGrip2.add( controllerModelFactory.createControllerModel( controllerGrip2 ) );
+        scene.add( controllerGrip2 );
+
+        gltfLoader.setPath('');
+
+        gltfLoader.load("https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/meta-quest-touch-plus/left.glb", (asset) => {
+          leftController = asset;
+        });
+        gltfLoader.load("https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/meta-quest-touch-plus/right.glb", (asset) => {
+          rightController = asset;
+        });
+      }
+
+			function buildController( data ) {
+        let geometry, material;
+        switch ( data.targetRayMode ) {
+          case 'tracked-pointer':
+            geometry = new THREE.BufferGeometry();
+            geometry.setAttribute( 'position', new THREE.Float32BufferAttribute( [ 0, 0, 0, 0, 0, - 1 ], 3 ) );
+            geometry.setAttribute( 'color', new THREE.Float32BufferAttribute( [ 0.5, 0.5, 0.5, 0, 0, 0 ], 3 ) );
+            material = new THREE.LineBasicMaterial( { vertexColors: true, blending: THREE.AdditiveBlending } );
+            return new THREE.Line( geometry, material );
+          case 'gaze':
+            geometry = new THREE.RingGeometry( 0.02, 0.04, 32 ).translate( 0, 0, - 1 );
+            material = new THREE.MeshBasicMaterial( { opacity: 0.5, transparent: true } );
+            return new THREE.Mesh( geometry, material );
+        }
+      }
+
+
+      function onRequestSession(){
+        let sessionInit = {
+          requiredFeatures: ['local-floor'],
+          optionalFeatures: ['shared', 'unbounded'],
+        };
+        navigator.xr.requestSession('immersive-ar', sessionInit).then((session) => {
+          session.mode = 'immersive-ar';
+          xrButton.setSession(session);
+
+          socket = new WebSocket("wss://hmie1gs4te.execute-api.us-east-1.amazonaws.com/production/");
+          socket.addEventListener("open", (event) => {
+            madeRequest = false;
+            if (peerID) {
+              session.requestReferenceSpace("viewer").then((space) => {
+                viewerspace = space;
+                onSessionStarted(session);
+              });
+            }
+          });
+          socket.addEventListener("close", (event) => {
+            setTimeout(() => {
+              madeRequest = false;
+              socket === null;
+            }, 5000);
+          });
+          socket.addEventListener("error", (event) => {
+            setTimeout(() => {
+              madeRequest = false;
+              socket === null;
+            }, 1000);
+          });
+          socket.addEventListener("message", (event) => {
+            console.log("message:" + event.data);
+            for (const [peer, score] of Object.entries(JSON.parse(event.data))){
+              if (!(peer in peerconnections) && (peer !== peerID)) {
+                peerConnection(peerjsConnection.connect(peer));
+              }
+              scores[peer] = score;
+            }
+          });
+
+          const response = fetch("https://yourappname.metered.live/api/v1/turn/credentials?apiKey=dde9026f4450b93c51eeb21724f4764f6596").then((response) => {
+            response.json().then((iceServers) => {
+              peerjsConnection = new Peer({
+                config: {'iceServers': iceServers},
+                debug: 0
+              });
+              peerjsConnection.on('open', function (id) {
+                peerID = id;
+                if (socket.readyState == 1) {
+                  session.requestReferenceSpace("viewer").then((space) => {
+                    viewerspace = space;
+                    onSessionStarted(session);
+                  });
+                }
+              });
+              peerjsConnection.on('call', function (media_connection) {
+                console.log("call");
+              });
+              peerjsConnection.on('connection', peerConnection);
+
+              peerjsConnection.on('disconnected', function() {
+                console.log("disconnected");
+                const conn = peerjsConnection;
+                setTimeout(() => {
+                  console.log("reconnecting");
+                  if (!conn.destroyed) {
+                    conn.reconnect();
+                  }
+                }, 5000);
+              });
+              peerjsConnection.on('error', function(err) {
+                console.log("error:" + err);
+              });
+            });
+          });
+        });
+      }
+
+      function updateSpace() {
+        if ( peerjsConnection === null)
+          return;
+        
+        if (sharedspace.UUId.length !== 0) {
+          const requestString =
+          {
+            "action": "SharedSpacePeers",
+            "info": {
+              "spaceID": sharedspace.UUId,
+              "peerID": peerID
+            }
+          };
+          socket.send(JSON.stringify(requestString));
+        }
+        
+        setTimeout(updateSpace, 1000);
+      }
+
+      function sendScore(attacker, victim){
+        if (peerjsConnection === null)
+          return;
+
+        console.log("sending hit of " + attacker + " to " + victim);
+        fetch("https://ztijb46tnf.execute-api.us-east-1.amazonaws.com/SherUpdateScore?player="+attacker+"&victim="+victim, {
+            method: "GET",
+            mode: "cors"});
+      }
+
+      function onSessionStarted(session){
+        session.addEventListener('end', onSessionEnded);
+        renderer.xr.setSession(session);
+        renderer.setAnimationLoop(render);
+      }
+
+      function onEndSession(session){
+        session.end();
+      }
+
+      function onSessionEnded(event){
+        xrButton.setSession(null);
+
+        renderer.setAnimationLoop(null);
+
+        peerconnections = {};
+        peerjsConnection.destroy();
+        socket.close();
+        peerjsConnection = null;  
+        sharedspace = null;
+        bullets.clear();    
+        spaceRequested = false;    
+      }
+
+      function onWindowResize(){
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+
+      function render(timestamp, frame){
+				const delta = clock.getDelta();
+
+        let x = mixers.length;
+				while(x--){
+          const mixer = mixers[x];
+
+          if (mixer.time >= 1) {
+            mixer.getRoot().parent.removeFromParent();
+            mixers.splice(x, 1);
+          } else {
+					  mixer.update( delta );
+          }
+				}
+
+        if (frame){
+          
+          if (!spaceRequested) {
+            spaceRequested = true;
+
+            renderer.xr.getSession().requestReferenceSpace("shared").then((space) => {
+              sharedspace = space;
+              renderer.xr.setReferenceSpace(space);
+              updateSpace();
+              //sharedspace.onReset = updateSpace;
+            });
+          }
+
+          // detect hits
+          const playerboxes = {};
+          for(const [key, val] of Object.entries(peerconnections)){
+            const playerWrap = scene.getObjectByName(key);
+            if (playerWrap)
+              playerboxes[key] = new THREE.Box3().setFromObject(playerWrap.children[0].children[0]);
+          }
+          let x = mixers.length;
+          while(x--){
+            const mixer = mixers[x];
+
+            const bullet = mixer.getRoot().parent;
+            const bulletBox = new THREE.Box3().setFromObject(bullet);
+            for(const [playerID, playerbox] of Object.entries(playerboxes)) {
+              if (bulletBox.intersectsBox(playerbox)) {
+                mixer.stopAllAction();
+                bullet.removeFromParent();
+
+                sendScore(peerID, playerID);
+              }
+            }
+          }
+
+          if (sharedspace && (framecount++ % 5 === 0)) {
+            const viewerTransform = frame.getPose(viewerspace, sharedspace).transform;
+            const info = { 
+              'peer': peerID,
+              'position': viewerTransform.position.toJSON(),
+              'orientation': viewerTransform.orientation.toJSON()
+            };
+            for(let x = 0; x < frame.session.inputSources.length; x++) {
+              const input = frame.session.inputSources[x];
+              const pose = frame.getPose(input.gripSpace, viewerspace);
+              if (pose) {
+                const controllerTransform = pose.transform;
+                info[input.handedness] = { 
+                  'position': controllerTransform.position.toJSON(),
+                  'orientation': controllerTransform.orientation.toJSON()
+                };
+              }
+            }
+            let bulletPositions = [];
+            let target = new THREE.Vector3();
+            for(let x = 0; x < bullets.children.length; x++) {
+              let bulletPosition = bullets.children[x].children[0].getWorldPosition(target);
+              bulletPositions.push( {x: target.x, y: target.y, z: target.z});
+            }
+            info.bullets = bulletPositions;
+
+            for(const [key, val] of Object.entries(peerconnections)){
+              if (val.open)
+                val.send(info);
+            }
+          }
+
+          renderer.render(scene, camera);
+        }
+      }
+    </script>
+  </body>
+</html>
